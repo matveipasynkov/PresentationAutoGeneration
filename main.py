@@ -1,90 +1,125 @@
-import json
+import os
+import requests
+import subprocess
 import speech_recognition as sr
 from pptx import Presentation
-import spacy
 
-# Загрузка NLP-модели
-nlp = spacy.load("ru_core_news_sm")
-
-# Конфигурация
-CONFIG_FILE = "config.json"
+# Настройки
 PPTX_FILE = "auto_presentation.pptx"
-
-def load_config():
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config = json.load(f)
-        # Преобразуем ключевые слова в леммы
-        for section in config["sections"]:
-            lemmatized_keywords = []
-            for phrase in section["keywords"]:
-                doc = nlp(phrase)
-                lemmatized_keywords.extend([token.lemma_ for token in doc])
-            section["lemmas"] = list(set(lemmatized_keywords))
-        return config
+OLLAMA_URL = "http://localhost:11434/api/generate"
+MODEL_NAME = "llama3.2"
 
 def recognize_speech():
     r = sr.Recognizer()
     with sr.Microphone() as source:
-        print("Говорите...")
-        audio = r.listen(source)
-        
+        print("\n🎤 Говорите... (скажите 'стоп' для выхода)")
+        audio = r.listen(source, phrase_time_limit=15)
     try:
-        text = r.recognize_google(audio, language="ru-RU").lower()
-        print(f"Распознано: {text}")
-        return text
-    except sr.UnknownValueError:
-        return ""
-    except sr.RequestError:
-        print("Ошибка сервиса распознавания")
+        return r.recognize_google(audio, language="ru-RU")
+    except:
         return ""
 
-def create_slide(presentation, section):
+def generate_slide_data(text):
     try:
-        slide_layout = presentation.slide_layouts[1]  # Заголовок + текст
-        slide = presentation.slides.add_slide(slide_layout)
+        # Генерация заголовка
+        title_prompt = f"""<|begin_of_text|>
+        [INST] Выдели основную тему из текста (3-5 слов):
+        "{text}". Ответ дай только самой темой без пояснений. [/INST]
+        """
         
-        # Заголовок
-        title_shape = slide.shapes.title
-        title_shape.text = section["title"]
+        title_response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "prompt": title_prompt,
+                "stream": False,
+                "options": {"temperature": 0.3}
+            }
+        ).json().get("response", "").strip().replace('"', '')
+
+        # Генерация контента
+        content_prompt = f"""<|begin_of_text|>
+        [INST] Сгенерируй 3 ключевых пункта для слайда на тему "{title_response}"
+        на основе текста: "{text}". Формат: маркированный список. [/INST]
+        """
         
-        # Контент
-        content_shape = slide.placeholders[1]
-        tf = content_shape.text_frame
-        for item in section["content"]:
-            p = tf.add_paragraph()
-            p.text = item
-            p.level = 0
+        content_response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "prompt": content_prompt,
+                "stream": False,
+                "options": {"temperature": 0.5}
+            }
+        ).json().get("response", "").split("\n")
+
+        return title_response, [line for line in content_response if line.strip()]
+    
     except Exception as e:
-        print(f"Ошибка создания слайда: {e}")
+        print(f"Ошибка генерации: {e}")
+        return "Ошибка", ["Не удалось сгенерировать контент"]
+
+def create_slide(presentation, title, content):
+    slide_layout = presentation.slide_layouts[1]
+    slide = presentation.slides.add_slide(slide_layout)
+    slide.shapes.title.text = title[:50]  # Заголовок
+    content_box = slide.placeholders[1]
+    for line in content[:3]:  # Контент (первые 3 пункта)
+        content_box.text_frame.add_paragraph().text = line[:100]
+
+def refresh_powerpoint():
+    script = f'''
+    tell application "Microsoft PowerPoint"
+        activate
+        close active presentation saving yes
+        open POSIX file "{os.path.abspath(PPTX_FILE)}"
+        delay 3
+        tell active presentation
+            set slideCount to count of slides
+            if slideCount > 0 then
+                set curSlide to slide index of slide range of selection of document window 1
+                go to slide view of document window 1 number slideCount
+            end if
+        end tell
+    end tell
+    '''
+    subprocess.run(["osascript", "-e", script])
+
 
 def main():
-    config = load_config()
-    prs = Presentation()
-    
+    # Создаём или загружаем существующую презентацию
+    if os.path.exists(PPTX_FILE):
+        prs = Presentation(PPTX_FILE)
+    else:
+        prs = Presentation()
+
     try:
         while True:
-            text = recognize_speech()
-            if "стоп" in text:
+            text = recognize_speech().strip()
+            if not text:
+                continue
+            
+            print(f"\n🔊 Распознано: {text}")
+            
+            if "стоп" in text.lower():
                 break
-                
-            if text:
-                doc = nlp(text)
-                user_lemmas = [token.lemma_ for token in doc]
-                print(f"Леммы пользователя: {user_lemmas}")
-                
-                # Поиск подходящего раздела
-                for section in config["sections"]:
-                    if any(lemma in user_lemmas for lemma in section["lemmas"]):
-                        print(f"Найден раздел: {section['title']}")
-                        create_slide(prs, section)
-                        prs.save(PPTX_FILE)  # Сохраняем после каждого изменения
-                        break
-                
-    except KeyboardInterrupt:
-        pass
-    
-    prs.save(PPTX_FILE)
-    print(f"Презентация сохранена как {PPTX_FILE}")
+            
+            # Генерация данных для слайда
+            title, content = generate_slide_data(text)
+            print(f"\n📄 Заголовок: {title}")
+            print("📌 Контент:", "\n • ".join(content))
+            
+            # Создание нового слайда
+            create_slide(prs, title, content)
+            
+            # Сохранение изменений и обновление PowerPoint
+            prs.save(PPTX_FILE)
+            refresh_powerpoint()
+            print("✅ Слайд сохранен и отображен!")
+            
+    finally:
+        prs.save(PPTX_FILE)
+        print(f"\n💾 Презентация сохранена как: {PPTX_FILE}")
 
 if __name__ == "__main__":
     main()
